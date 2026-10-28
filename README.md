@@ -479,3 +479,9 @@ Forks and modified versions must remove them.
 ## Star history
 
 [![Star History Chart](https://api.star-history.com/svg?repos=storytold/filmcraft&type=Date&legend=top-left)](https://www.star-history.com/?repos=storytold%2Ffilmcraft&type=date&legend=top-left)
+
+## Documentação para agentes
+
+Última atualização desta seção: 2026-10-28.
+
+Comece pelo [índice de documentação](docs/INDEX.md): visão geral, funcionalidades, padrões, operação, decisões e rotina de manutenção para retomar o projeto em uma nova sessão.
