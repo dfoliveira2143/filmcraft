@@ -1,12 +1,16 @@
 # FilmCraft — instructions for agents
 
+## Politica de validacao local
+
+Siga a politica obrigatoria de [validacao documental e confirmacao para testes](AGENTS.md#validacao-documental-e-confirmacao-para-testes). Commits exclusivamente documentais elegiveis usam revisao do diff, `git diff --check`, conferencia de links locais e coerencia das instrucoes; informe a dispensa da validacao completa. Testes, compilacao, lint de codigo e CI exigem explicacao previa de necessidade e alcance e confirmacao explicita do usuario antes de executar. Comandos e rotinas abaixo estao sujeitos a essa politica, inclusive verificacoes iniciais; autonomia nao dispensa essa confirmacao.
+
 FilmCraft is a clean-room, open-source, pure-Rust non-linear video editor targeting Adobe Premiere Pro parity (and beyond). Native on macOS, Windows, Linux; web via WASM. Sibling of `../photocraft` (Photoshop), `../pdfcraft` (Acrobat) and `../vectorcraft` (Illustrator; formerly DrawCraft), with the same conventions.
 
 ## Start every session here
 `plan/` is maintainer-local (gitignored, not in the repo). Each step names the public equivalent to use if you don't have it.
 1. Read `plan/STATUS.md` (current milestone, next unchecked task, blockers). Public: [`ROADMAP.md`](ROADMAP.md), then [`docs/gaps.md`](docs/gaps.md) (ranked shortfalls) and [`docs/roadmap.md`](docs/roadmap.md) (current focus).
 2. Read the task in `plan/execution-plan.md` §3, the relevant section of `plan/architecture.md`, and the README/docs of the crate you touch. Public: [`docs/architecture.md`](docs/architecture.md), [`docs/contributing.md`](docs/contributing.md), [`docs/testing.md`](docs/testing.md). Visual/behaviour reference: `plan/premiere/` (local only, never committed).
-3. Follow the autonomous operation protocol (`plan/execution-plan.md` §7; public summary: [`docs/agents.md`](docs/agents.md) §5–7). Don't stop to ask unless it lists the decision as the user's.
+3. Follow the autonomous operation protocol (`plan/execution-plan.md` §7; public summary: [`docs/agents.md`](docs/agents.md) §5–7). Ask for explicit user confirmation before tests or code validation as required by AGENTS.md; otherwise follow the autonomy protocol.
 
 ## Non-negotiables
 **Read [`AGENTS.md`](AGENTS.md) first; its rules override everything here.**
@@ -19,7 +23,7 @@ FilmCraft is a clean-room, open-source, pure-Rust non-linear video editor target
 - **Time goes through `chrono`** (workspace dependency). Never hand-roll UTC/calendar conversion (days-to-date algorithms, leap-year math); a crate owns only its output format string. The one exception is range extension: past the years chrono can represent, shift the date by whole 400-year Gregorian cycles (146,097 days, after which the calendar repeats), let chrono compute the month and day, and add the cycles back to the year (splitting seconds into hours, minutes and seconds is plain arithmetic).
 - **Everything is a command** (`crates/engine`): id, label, menu path, shortcut, params, enabled(), run(). UI, CLI, control channel and MCP all dispatch by id.
 - **Everything is agent-drivable:** every interactive widget registers an automation id; UI state is serde so the control channel can read/set it.
-- **Quality gates** before every commit: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo xtask layers`, `cargo xtask assets`, `cargo xtask wasm` (checks L0–L4 crates). `cargo xtask ci` runs them all.
+- **Quality gates** before commits requiring code validation (subject to the documentation exception and explicit user confirmation in AGENTS.md): `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo xtask layers`, `cargo xtask assets`, `cargo xtask wasm` (checks L0–L4 crates). `cargo xtask ci` runs them all.
 - **Commits:** one task id per commit (`M2.4: CABAC residual decoding`). Only green states. End messages with the attribution line required by the environment.
 
 ## Running and looking at the app
