@@ -47,3 +47,5 @@ Os guias são mapas de navegação, não novas cópias dos contratos técnicos. 
 - [Transcripts and text-based editing](transcripts.md)
 - [UI and interaction parity](ui-parity.md)
 - [FilmCraft on the web](web.md)
+
+- [Creative Workshop: origem, identidade e publicação](branding.md)

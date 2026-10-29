@@ -461,7 +461,7 @@ fn about_tab(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
     ui.add_space(6.0);
     ui.heading("FilmCraft");
     ui.label(tlf!("Version {version}", version = env!("CARGO_PKG_VERSION")));
-    ui.label(tl!("A clean-room, pure-Rust non-linear video editor. Part of the ArtCraft family."));
+    ui.label(tl!("A clean-room, pure-Rust non-linear video editor. Part of the Creative Workshop family."));
     ui.add_space(10.0);
     let mut link = |ui: &mut egui::Ui, id: &str, icon: Icon, label: &str, url: &str, primary: bool| {
         let size = egui::vec2(ui.available_width(), if primary { 36.0 } else { 28.0 });
@@ -490,10 +490,10 @@ fn about_tab(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
             links::open(app, ui.ctx(), url);
         }
     };
-    link(ui, "discord", Icon::Chat, tl!("Join the ArtCraft Discord"), links::DISCORD, true);
+    link(ui, "discord", Icon::Chat, tl!("Project support"), links::DISCORD, true);
     ui.add_space(6.0);
-    link(ui, "website", Icon::Globe, "getartcraft.com", links::WEBSITE, false);
-    link(ui, "appPage", Icon::Globe, tl!("FilmCraft on getartcraft.com"), links::APP_PAGE, false);
+    link(ui, "website", Icon::Globe, "github.com/dfoliveira2143", links::WEBSITE, false);
+    link(ui, "appPage", Icon::Globe, tl!("FilmCraft on github.com/dfoliveira2143"), links::APP_PAGE, false);
     link(ui, "github", Icon::Code, tl!("Source code on GitHub"), links::GITHUB, false);
     link(ui, "reportIssue", Icon::Code, tl!("Report an issue"), links::ISSUES, false);
     ui.add_space(10.0);
