@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    BLK4_XY, Cand, Deadzone, Depth, Pixel, SliceEnc, Src, ZIGZAG4, ZIGZAG8, cavlc, chroma_qp_prime, decimate_score, dequant_chroma_dc, dequant4, dequant8,
+    fdct4, fdct8, idct4, idct8, quant_chroma_dc, quant4, quant8, ssd,
+};
 
 /// The transform trial's bit estimate of a level `v`: `0.4` for zero, `3 + 2·log2|v|` otherwise.
 /// Levels below 256 (nearly all) read it from a table of exactly those values.
@@ -16,13 +19,48 @@ fn level_bits_table() -> &'static [f64; 256] {
     T.get_or_init(|| std::array::from_fn(|a| if a == 0 { 0.4 } else { 3.0 + 2.0 * (a as f64).log2() }))
 }
 
-impl<'a, 'b> SliceEnc<'a, 'b> {
+/// `rec = clamp(pred + residual(x, y))` for the 4x4 chroma block at (`bx`, `by`) of an 8x8 chroma plane.
+fn add_chroma_residual<P: Pixel>(rec: &mut [P], pred: &[P; 64], d: Depth, bx: usize, by: usize, residual: impl Fn(usize, usize) -> i32) {
+    for y in 0..4 {
+        for x in 0..4 {
+            let i = (by + y) * 8 + bx + x;
+            rec[i] = P::clip(pred[i].get() + residual(x, y), d);
+        }
+    }
+}
+
+impl<'a, 'b, P: Pixel> SliceEnc<'a, 'b, P> {
     // ------------------------------------------------------------------ residual coding helpers
 
+    /// Transform + quantise chroma 4x4 block `b` of a component. Returns (unquantised DC, quantised
+    /// coefficients in raster order, AC coefficients in scan order).
+    fn quant_chroma_ac_block(&self, s: &[P; 64], p: &[P; 64], b: usize, qpc: u8, dz: Deadzone) -> (i32, [i32; 16], [i16; 16]) {
+        let (bx, by) = ((b & 1) * 4, (b >> 1) * 4);
+        let mut d = [0i32; 16];
+        for y in 0..4 {
+            for x in 0..4 {
+                d[y * 4 + x] = s[(by + y) * 8 + bx + x].get() - p[(by + y) * 8 + bx + x].get();
+            }
+        }
+        let mut t = fdct4(&d);
+        let dc = t[0];
+        quant4(&mut t, self.f.qt, qpc, dz, true);
+        if self.f.p.cavlc_clamp {
+            for v in t.iter_mut().skip(1) {
+                *v = (*v).clamp(-cavlc::MAX_LEVEL, cavlc::MAX_LEVEL);
+            }
+        }
+        let mut scan = [0i16; 16];
+        for k in 1..16 {
+            scan[k] = t[ZIGZAG4[k]] as i16;
+        }
+        (dc, t, scan)
+    }
+
     /// Code chroma residual for prediction `pu`, `pv`; fills code/info and reconstruction. Returns chroma cbp.
-    pub(super) fn code_chroma(&self, src: &Src, pu: &[u8; 64], pv: &[u8; 64], qp: u8, intra: bool, c: &mut Cand) -> u8 {
+    pub(super) fn code_chroma(&self, src: &Src<P>, pu: &[P; 64], pv: &[P; 64], qp: u8, intra: bool, c: &mut Cand<P>) -> u8 {
         let qt = self.f.qt;
-        let qpc = chroma_qp(qp as i32 + self.f.p.chroma_qp_offset);
+        let qpc = chroma_qp_prime(qp as i32, self.f.p.chroma_qp_offset, self.f.p.depth.qp_offset);
         let dz = if intra { Deadzone::INTRA } else { Deadzone::INTER };
         let mut dc_any = false;
         let mut ac_any = false;
@@ -33,25 +71,8 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             let mut dc = [0i32; 4];
             let mut ac_score = 0;
             for b in 0..4 {
-                let (bx, by) = ((b & 1) * 4, (b >> 1) * 4);
-                let mut d = [0i32; 16];
-                for y in 0..4 {
-                    for x in 0..4 {
-                        d[y * 4 + x] = s[(by + y) * 8 + bx + x] as i32 - p[(by + y) * 8 + bx + x] as i32;
-                    }
-                }
-                let mut t = fdct4(&d);
-                dc[b] = t[0];
-                quant4(&mut t, qt, qpc, dz, true);
-                if self.f.p.cavlc_clamp {
-                    for v in t.iter_mut().skip(1) {
-                        *v = (*v).clamp(-cavlc::MAX_LEVEL, cavlc::MAX_LEVEL);
-                    }
-                }
-                let mut scan = [0i16; 16];
-                for k in 1..16 {
-                    scan[k] = t[ZIGZAG4[k]] as i16;
-                }
+                let (dc_coef, t, scan) = self.quant_chroma_ac_block(s, p, b, qpc, dz);
+                dc[b] = dc_coef;
                 ac_score += decimate_score(&scan[1..]);
                 c.code.cac[comp * 4 + b] = scan;
                 coefs[comp][b] = t;
@@ -105,20 +126,10 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
                 let rec = if comp == 0 { &mut c.ru } else { &mut c.rv };
                 if nz == 0 {
                     let dcv = (t[0] + 32) >> 6;
-                    for y in 0..4 {
-                        for x in 0..4 {
-                            let i = (by + y) * 8 + bx + x;
-                            rec[i] = (p[i] as i32 + dcv).clamp(0, 255) as u8;
-                        }
-                    }
+                    add_chroma_residual(rec, p, self.f.p.depth, bx, by, |_, _| dcv);
                 } else {
                     let r = idct4(&t);
-                    for y in 0..4 {
-                        for x in 0..4 {
-                            let i = (by + y) * 8 + bx + x;
-                            rec[i] = (p[i] as i32 + r[y * 4 + x]).clamp(0, 255) as u8;
-                        }
-                    }
+                    add_chroma_residual(rec, p, self.f.p.depth, bx, by, |x, y| r[y * 4 + x]);
                 }
             }
         }
@@ -132,7 +143,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
     }
 
     /// Inter luma residual with the 4x4 transform. Returns luma cbp.
-    fn code_luma4(&self, src: &[u8; 256], pred: &[u8; 256], qp: u8, dz: Deadzone, decimate: bool, c: &mut Cand) -> u8 {
+    fn code_luma4(&self, src: &[P; 256], pred: &[P; 256], qp: u8, dz: Deadzone, decimate: bool, c: &mut Cand<P>) -> u8 {
         let qt = self.f.qt;
         let mut coefs = [[0i32; 16]; 16];
         let mut score8 = [0u32; 4];
@@ -142,7 +153,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             for y in 0..4 {
                 for x in 0..4 {
                     let i = (by * 4 + y) * 16 + bx * 4 + x;
-                    d[y * 4 + x] = src[i] as i32 - pred[i] as i32;
+                    d[y * 4 + x] = src[i].get() - pred[i].get();
                 }
             }
             let mut t = fdct4(&d);
@@ -191,7 +202,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
                 for y in 0..4 {
                     for x in 0..4 {
                         let i = off + y * 16 + x;
-                        c.ry[i] = (pred[i] as i32 + r[y * 4 + x]).clamp(0, 255) as u8;
+                        c.ry[i] = P::clip(pred[i].get() + r[y * 4 + x], self.f.p.depth);
                     }
                 }
             }
@@ -200,7 +211,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
     }
 
     /// Inter luma residual with the 8x8 transform. Returns luma cbp.
-    fn code_luma8(&self, src: &[u8; 256], pred: &[u8; 256], qp: u8, dz: Deadzone, decimate: bool, c: &mut Cand) -> u8 {
+    fn code_luma8(&self, src: &[P; 256], pred: &[P; 256], qp: u8, dz: Deadzone, decimate: bool, c: &mut Cand<P>) -> u8 {
         let qt = self.f.qt;
         let mut coefs = [[0i32; 64]; 4];
         let mut score = [0u32; 4];
@@ -210,7 +221,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             for y in 0..8 {
                 for x in 0..8 {
                     let i = (oy + y) * 16 + ox + x;
-                    d[y * 8 + x] = src[i] as i32 - pred[i] as i32;
+                    d[y * 8 + x] = src[i].get() - pred[i].get();
                 }
             }
             let mut t = fdct8(&d);
@@ -250,7 +261,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             for y in 0..8 {
                 for x in 0..8 {
                     let i = (oy + y) * 16 + ox + x;
-                    c.ry[i] = (pred[i] as i32 + r[y * 8 + x]).clamp(0, 255) as u8;
+                    c.ry[i] = P::clip(pred[i].get() + r[y * 8 + x], self.f.p.depth);
                 }
             }
         }
@@ -258,7 +269,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
     }
 
     /// Code an inter candidate's residual given its luma/chroma prediction.
-    pub(super) fn code_inter(&self, src: &Src, py: &[u8; 256], pu: &[u8; 64], pv: &[u8; 64], qp: u8, c: &mut Cand) {
+    pub(super) fn code_inter(&self, src: &Src<P>, py: &[P; 256], pu: &[P; 64], pv: &[P; 64], qp: u8, c: &mut Cand<P>) {
         let t8_allowed = self.f.p.t8x8;
         let (use8, cbpl) = if t8_allowed {
             if self.f.p.adaptive_t8 {
@@ -271,7 +282,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
                 let cbp4 = self.code_luma4(&src.y, py, qp, Deadzone::INTER, self.f.p.decimate, c);
                 let lam = self.f.lam.ssd[qp as usize];
                 let lb = level_bits_table();
-                let cost = |cc: &Cand, cbp: u8, eight: bool| {
+                let cost = |cc: &Cand<P>, cbp: u8, eight: bool| {
                     let d = ssd(&src.y, 16, &cc.ry, 16, 16, 16) as f64;
                     let mut bits = 0f64;
                     if eight {
