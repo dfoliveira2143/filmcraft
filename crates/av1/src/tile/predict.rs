@@ -1,5 +1,10 @@
 use super::tx_size::find_tx_size;
-use super::*;
+use super::{
+    BLOCK_64X64, DC_PRED, H_PRED, II_DC_PRED, II_H_PRED, II_V_PRED, INTRA_FRAME, IntraParams, MAX_TX_SIZE_RECT, MI_HEIGHT_LOG2, MI_WIDTH_LOG2,
+    NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE, Result, SMOOTH_H_PRED, SMOOTH_PRED, SMOOTH_V_PRED, TX_4X4, TX_16X32, TX_32X16, TX_32X32, TX_HEIGHT,
+    TX_HEIGHT_LOG2, TX_WIDTH, TX_WIDTH_LOG2, TileDecoder, UV_CFL_PRED, V_PRED, block_height, block_width, is_directional_mode, predict_intra, round2_signed,
+};
+use crate::inter::PredBlock;
 
 impl<'a, 'f> TileDecoder<'a, 'f> {
     // ---- prediction and residual ----------------------------------------------------------
@@ -82,7 +87,7 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
                 let mut c = 0;
                 let mut x = 0;
                 while x < n4w * 4 {
-                    self.predict_inter(plane, base_x + x, base_y + y, pred_w, pred_h, cand_row + r, cand_col + c);
+                    self.predict_inter(PredBlock { plane, x: base_x + x, y: base_y + y, w: pred_w, h: pred_h }, cand_row + r, cand_col + c);
                     x += pred_w;
                     c += 1;
                 }
@@ -111,7 +116,6 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
     }
 
     pub(super) fn residual(&mut self) -> Result<()> {
-        let sb_mask = if self.fs.seq.use_128x128_superblock { 31 } else { 15 };
         let ms = self.b.mi_size;
         let width_chunks = (block_width(ms) >> 6).max(1);
         let height_chunks = (block_height(ms) >> 6).max(1);
@@ -121,7 +125,6 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
             for chunk_x in 0..width_chunks {
                 let mi_row_chunk = self.b.mi_row + (chunk_y << 4);
                 let mi_col_chunk = self.b.mi_col + (chunk_x << 4);
-                let _ = (mi_row_chunk & sb_mask, mi_col_chunk & sb_mask);
                 for plane in 0..(1 + 2 * self.b.has_chroma as usize) {
                     let tx_sz = if self.b.lossless { TX_4X4 } else { self.get_tx_size(plane, self.b.tx_size) };
                     let step_x = TX_WIDTH[tx_sz] as usize >> 2;
@@ -257,7 +260,7 @@ impl<'a, 'f> TileDecoder<'a, 'f> {
         if !self.b.skip {
             let eob = self.coeffs(plane, start_x, start_y, tx_sz);
             if eob > 0 {
-                self.reconstruct(plane, start_x, start_y, tx_sz);
+                self.reconstruct(plane, start_x, start_y, tx_sz, eob == 1);
             }
         }
         for i in 0..step_y {
