@@ -8,7 +8,7 @@ fn demo_project() -> (Project, ItemId, ItemId) {
     let clip = p.add_item(
         "Ocean_Sunset.mp4",
         Label::Iris,
-        ItemKind::Media(MediaClip {
+        ItemKind::Media(Box::new(MediaClip {
             media: MediaRef::Generator(Generator::Demo(DemoScene::OceanSunset)),
             info,
             interpret: Default::default(),
@@ -18,7 +18,7 @@ fn demo_project() -> (Project, ItemId, ItemId) {
             offline: false,
             proxy: None,
             identity: None,
-        }),
+        })),
         None,
     );
     let seq = p.new_sequence("Sequence 01", SequenceSettings::default(), 3, 3, None);
@@ -393,4 +393,19 @@ fn source_par_follows_interpret_footage_subclips_and_sequences() {
     assert_eq!(p.source_par(adj), None);
     assert_eq!(p.conformed_source_size(adj, (4, 3)), Some((1440.0, 1080.0)));
     assert_eq!(p.source_par(ItemId(987_654_321)), None);
+}
+
+#[test]
+fn sequence_display_format_round_trips_and_old_files_load_as_timecode() {
+    use filmcraft_time::TimeDisplay;
+    for d in [TimeDisplay::Timecode, TimeDisplay::Feet35, TimeDisplay::Feet16, TimeDisplay::Frames] {
+        let st = SequenceSettings { display: d, ..Default::default() };
+        let back: SequenceSettings = serde_json::from_str(&serde_json::to_string(&st).unwrap()).unwrap();
+        assert_eq!(back.display, d);
+    }
+    // a file saved before the setting existed has no `display` key
+    let mut v = serde_json::to_value(SequenceSettings::default()).unwrap();
+    assert!(v.as_object_mut().unwrap().remove("display").is_some());
+    let old: SequenceSettings = serde_json::from_value(v).unwrap();
+    assert_eq!(old.display, TimeDisplay::Timecode);
 }

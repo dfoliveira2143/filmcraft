@@ -1,4 +1,4 @@
-use super::*;
+use super::{BTreeMap, Deserialize, ItemId, Serialize, TICKS_PER_SECOND, Tick};
 
 /// How a sequence is shown in the Timeline panel: its zoom, scroll position and track heights.
 /// Each open sequence keeps its own (as Premiere's sequence tabs do).
@@ -60,7 +60,7 @@ impl ProjectView {
     pub const MAX_PLAYHEAD: Tick = Tick(10_000_000 * TICKS_PER_SECOND);
 }
 
-/// A LUT imported into the project (`lut.import`). Lumetri refers to it as `lib:<id>`.
+/// A LUT imported into the project (`lut.import`). Color Grading refers to it as `lib:<id>`.
 /// Largest embedded LUT source accepted from a project or import (8 MiB).
 pub const MAX_LUT_TEXT_BYTES: usize = 8 << 20;
 
