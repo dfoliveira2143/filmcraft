@@ -29,6 +29,11 @@ const MAX_DICT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DICT_ENTRIES: usize = 500_000;
 /// Most ARPAbet symbols retained for one dictionary pronunciation.
 const MAX_PRONUNCIATION_PHONES: usize = 256;
+/// Most alternative pronunciations kept for one word (CMUdict has at most a handful); equal
+/// repeats are kept once.
+const MAX_PRONUNCIATIONS_PER_WORD: usize = 32;
+/// Most phoneme bytes one script may expand to (a 1 MiB script is some 4 MiB of phonemes).
+const MAX_PHONEME_BYTES: usize = 16 * 1024 * 1024;
 /// Long unknown words are not useful narration and can make suffix fallback recurse repeatedly.
 const MAX_LETTER_TO_SOUND_CHARS: usize = 512;
 /// Maximum number of overrides honoured (excess ignored, not an error).
@@ -133,7 +138,11 @@ impl Lexicon {
                 return Err(LexError::TooManyEntries);
             }
             let key = key.to_ascii_uppercase();
-            entries.entry(key).or_default().push(phones.join(" "));
+            let pron = phones.join(" ");
+            let list = entries.entry(key).or_default();
+            if list.len() < MAX_PRONUNCIATIONS_PER_WORD && !list.contains(&pron) {
+                list.push(pron);
+            }
         }
         Ok(Lexicon { entries, skipped })
     }
@@ -235,26 +244,27 @@ pub fn phonemize(text: &str, lang: Lang, lex: &Lexicon, overrides: &Overrides) -
     let overrides = bounded_overrides(overrides);
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut sentence: Vec<Token> = Vec::new();
+    let mut spent = 0usize;
     for token in tokens {
         match token {
             Token::SentenceEnd => {
                 // The sentence terminator attaches to the last word as a period.
                 sentence.push(Token::Punct('.'));
-                flush_sentence(&mut sentence, &mut chunks, lex, &overrides, lang);
+                flush_sentence(&mut sentence, &mut chunks, &mut spent, lex, &overrides, lang)?;
             }
             Token::SentenceEndWith(c) => {
                 // `?` and `!` shape Kokoro's intonation; keep them.
                 sentence.push(Token::Punct(c));
-                flush_sentence(&mut sentence, &mut chunks, lex, &overrides, lang);
+                flush_sentence(&mut sentence, &mut chunks, &mut spent, lex, &overrides, lang)?;
             }
             Token::Pause { millis } => {
-                flush_sentence(&mut sentence, &mut chunks, lex, &overrides, lang);
+                flush_sentence(&mut sentence, &mut chunks, &mut spent, lex, &overrides, lang)?;
                 chunks.push(Chunk::Pause { millis });
             }
             other => sentence.push(other),
         }
     }
-    flush_sentence(&mut sentence, &mut chunks, lex, &overrides, lang);
+    flush_sentence(&mut sentence, &mut chunks, &mut spent, lex, &overrides, lang)?;
     Ok(chunks)
 }
 
@@ -276,13 +286,25 @@ fn bounded_overrides(overrides: &Overrides) -> BTreeMap<String, String> {
 }
 
 /// Phonemize one buffered sentence into zero or more `Phonemes` chunks.
-fn flush_sentence(sentence: &mut Vec<Token>, chunks: &mut Vec<Chunk>, lex: &Lexicon, overrides: &BTreeMap<String, String>, lang: Lang) {
+fn flush_sentence(
+    sentence: &mut Vec<Token>,
+    chunks: &mut Vec<Chunk>,
+    spent: &mut usize,
+    lex: &Lexicon,
+    overrides: &BTreeMap<String, String>,
+    lang: Lang,
+) -> Result<(), NormalizeError> {
     let tokens = std::mem::take(sentence);
     let mut out = String::new();
     for token in &tokens {
         match token {
             Token::Word(w) => {
                 let Some(p) = word_phonemes(w, lex, Some(overrides), lang) else { continue };
+                // respellings and pronunciations multiply every word: stop before the sentence outgrows the budget
+                *spent = spent.saturating_add(p.len() + 1);
+                if *spent > MAX_PHONEME_BYTES {
+                    return Err(NormalizeError::TooManyPhonemes);
+                }
                 if !out.is_empty() {
                     out.push(' ');
                 }
@@ -301,6 +323,7 @@ fn flush_sentence(sentence: &mut Vec<Token>, chunks: &mut Vec<Chunk>, lex: &Lexi
             chunks.push(Chunk::Phonemes(piece));
         }
     }
+    Ok(())
 }
 
 /// Split a phoneme string longer than [`MAX_CHUNK_CHARS`] at the last `,` `;` `:`
@@ -724,289 +747,271 @@ fn letter_to_sound(word: &str) -> Option<String> {
     if letters.is_empty() || letters.len() > MAX_LETTER_TO_SOUND_CHARS {
         return None;
     }
-    // -ture / -sure endings (nature, measure): the e belongs to the suffix, so it
-    // is handled before the silent-e rule.
-    if letters.len() >= 5 {
-        let tail_chars = letters.get(letters.len() - 4..)?;
-        let tail: String = tail_chars.iter().collect();
-        if tail == "ture" || tail == "sure" {
-            let head_chars = letters.get(..letters.len() - 4)?;
-            let head: String = head_chars.iter().collect();
-            let mut body = letter_to_sound(&head).unwrap_or_default();
-            if !body.is_empty() && !body.contains('ˈ') {
-                // mark the head's first vowel
-                if let Some(pos) = body.chars().collect::<Vec<_>>().iter().position(|c| is_vowel_kokoro(&c.to_string())) {
-                    let mut v: Vec<char> = body.chars().collect();
-                    v.insert(pos, 'ˈ');
-                    body = v.into_iter().collect();
-                }
-            }
-            body.push_str(if tail == "ture" { "ʧɚ" } else { "ʒɚ" });
-            return Some(body);
+    if let Some(word) = ture_sure_word(&letters) {
+        return Some(word);
+    }
+    let (chars, long_last, last_vowel_index) = strip_silent_e(&letters);
+    let mut lts = LetterToSound { chars: &chars, out: Vec::new(), vowel_positions: Vec::new(), long_last, last_vowel_index };
+    let mut i = 0usize;
+    while i < chars.len() {
+        match lts.step(i) {
+            Step::Next(next) => i = next,
+            Step::Stop => break,
         }
     }
-    // Silent final e: drop it and lengthen the last vowel ("cake" → kˈA k).
-    let mut chars = letters.clone();
-    let mut long_last = false;
-    let mut last_vowel_index: Option<usize> = None;
+    lts.finish()
+}
+
+/// -ture / -sure endings (nature, measure): the e belongs to the suffix, so the word is the head's
+/// sounds (stressed on its first vowel) plus the suffix, before the silent-e rule applies.
+fn ture_sure_word(letters: &[char]) -> Option<String> {
+    if letters.len() < 5 {
+        return None;
+    }
+    let tail: String = letters.get(letters.len() - 4..)?.iter().collect();
+    if tail != "ture" && tail != "sure" {
+        return None;
+    }
+    let head: String = letters.get(..letters.len() - 4)?.iter().collect();
+    let mut body = letter_to_sound(&head).unwrap_or_default();
+    if !body.is_empty() && !body.contains('ˈ') {
+        // mark the head's first vowel
+        if let Some(pos) = body.chars().collect::<Vec<_>>().iter().position(|c| is_vowel_kokoro(&c.to_string())) {
+            let mut v: Vec<char> = body.chars().collect();
+            v.insert(pos, 'ˈ');
+            body = v.into_iter().collect();
+        }
+    }
+    body.push_str(if tail == "ture" { "ʧɚ" } else { "ʒɚ" });
+    Some(body)
+}
+
+/// Silent final e: drop it and lengthen the last vowel ("cake" → kˈA k). Returns the letters, whether
+/// the last vowel is long, and that vowel's index.
+fn strip_silent_e(letters: &[char]) -> (Vec<char>, bool, Option<usize>) {
+    let mut chars = letters.to_vec();
     let ends_consonant_le = chars.len() >= 3
         && chars.last() == Some(&'e')
         && chars.get(chars.len() - 2) == Some(&'l')
         && chars.get(chars.len() - 3).is_some_and(|c| !is_vowel_letter(*c));
     if !ends_consonant_le && chars.len() >= 3 && chars.last() == Some(&'e') && chars.get(chars.len() - 2).is_some_and(|c| !is_vowel_letter(*c)) {
         chars.pop();
-        long_last = true;
-        last_vowel_index = chars.iter().rposition(|c| is_vowel_letter(*c));
+        let last_vowel_index = chars.iter().rposition(|c| is_vowel_letter(*c));
+        return (chars, true, last_vowel_index);
     }
-    let n = chars.len();
-    let mut out: Vec<String> = Vec::new();
-    let mut vowel_positions: Vec<usize> = Vec::new();
-    let mut i = 0usize;
-    while i < n {
-        let Some(rest) = chars.get(i..) else { break };
-        let at_start = i == 0;
+    (chars, false, None)
+}
+
+/// Where the letter-to-sound scan goes after a rule fired.
+enum Step {
+    /// Continue at this letter index.
+    Next(usize),
+    /// The rule consumed the rest of the word.
+    Stop,
+}
+
+/// Letter-to-sound state: the letters and the sounds produced so far.
+struct LetterToSound<'a> {
+    chars: &'a [char],
+    out: Vec<String>,
+    /// Indices into `out` of the vowels pushed.
+    vowel_positions: Vec<usize>,
+    long_last: bool,
+    last_vowel_index: Option<usize>,
+}
+
+impl LetterToSound<'_> {
+    fn push_all(&mut self, symbols: &[&str]) {
+        self.out.extend(symbols.iter().map(|s| (*s).to_string()));
+    }
+
+    /// Mark the most recent vowel with primary stress.
+    fn stress_last_vowel(&mut self) {
+        if let Some(&last) = self.vowel_positions.last()
+            && let Some(v) = self.out.get_mut(last)
+        {
+            *v = format!("ˈ{v}");
+        }
+    }
+
+    /// Apply the rule for the letters at `i`.
+    fn step(&mut self, i: usize) -> Step {
+        let chars = self.chars;
+        let Some(rest) = chars.get(i..) else { return Step::Stop };
         // Multi-letter rules first (longest match wins).
+        if let Some(step) = self.word_rule(i, rest) {
+            return step;
+        }
+        if let Some(step) = self.letter_group(i, rest) {
+            return step;
+        }
+        let Some(&c) = chars.get(i) else { return Step::Stop };
+        if is_vowel_letter(c) {
+            return Step::Next(i + self.vowel(i, c, rest));
+        }
+        self.consonant(i, c)
+    }
+
+    /// Suffixes and irregular groups: tion, sion, sch, -sten, -gue, -que, ough, gu, initial ps.
+    fn word_rule(&mut self, i: usize, rest: &[char]) -> Option<Step> {
         if rest.len() == 4 && rest.iter().copied().eq("tion".chars()) {
             // The vowel before the suffix takes the primary stress.
-            if let Some(&last) = vowel_positions.last()
-                && let Some(v) = out.get_mut(last)
-            {
-                *v = format!("ˈ{v}");
-            }
-            out.push("ʃ".into());
-            out.push("ə".into());
-            out.push("n".into());
-            break;
+            self.stress_last_vowel();
+            self.push_all(&["ʃ", "ə", "n"]);
+            return Some(Step::Stop);
         }
         if rest.len() == 4 && rest.iter().copied().eq("sion".chars()) {
-            if let Some(&last) = vowel_positions.last()
-                && let Some(v) = out.get_mut(last)
-            {
-                *v = format!("ˈ{v}");
-            }
-            out.push("ʒ".into());
-            out.push("ə".into());
-            out.push("n".into());
-            break;
+            self.stress_last_vowel();
+            self.push_all(&["ʒ", "ə", "n"]);
+            return Some(Step::Stop);
         }
         if rest.starts_with(&['s', 'c', 'h']) {
-            out.push("s".into());
-            out.push("k".into());
-            i += 3;
-            continue;
+            self.push_all(&["s", "k"]);
+            return Some(Step::Next(i + 3));
         }
         if rest == ['s', 't', 'e', 'n'] {
             // listen
-            out.push("s".into());
-            out.push("ə".into());
-            out.push("n".into());
-            break;
+            self.push_all(&["s", "ə", "n"]);
+            return Some(Step::Stop);
         }
         if rest == ['g', 'u', 'e'] {
-            out.push("ɡ".into());
-            break;
+            self.push_all(&["ɡ"]);
+            return Some(Step::Stop);
         }
         if rest == ['q', 'u', 'e'] {
-            out.push("k".into());
-            break;
+            self.push_all(&["k"]);
+            return Some(Step::Stop);
         }
         if rest.starts_with(&['o', 'u', 'g', 'h']) {
             // A famously irregular group; pick the "thought" vowel, f when final.
-            out.push("ɔ".into());
+            self.push_all(&["ɔ"]);
             if rest == ['o', 'u', 'g', 'h'] {
-                out.push("f".into());
-                break;
+                self.push_all(&["f"]);
+                return Some(Step::Stop);
             }
             if rest.starts_with(&['o', 'u', 'g', 'h', 't']) {
-                out.push("t".into());
-                i += 5;
-                continue;
+                self.push_all(&["t"]);
+                return Some(Step::Next(i + 5));
             }
-            i += 3;
-            continue;
+            return Some(Step::Next(i + 3));
         }
         if rest.starts_with(&['g', 'u']) && rest.len() > 2 {
             // The u is silent before a vowel (guard, guess).
-            out.push("ɡ".into());
-            i += 2;
-            continue;
+            self.push_all(&["ɡ"]);
+            return Some(Step::Next(i + 2));
         }
-        if rest.starts_with(&['p', 's']) && at_start {
-            out.push("s".into());
-            i += 2;
-            continue;
+        if rest.starts_with(&['p', 's']) && i == 0 {
+            self.push_all(&["s"]);
+            return Some(Step::Next(i + 2));
         }
+        None
+    }
+
+    /// Three- and two-letter consonant groups (igh, tch, dge, ch, sh, th, ph, ck, qu, wh, gh, ng,
+    /// nk, kn, gn, wr, mb).
+    fn letter_group(&mut self, i: usize, rest: &[char]) -> Option<Step> {
+        let n = self.chars.len();
+        let at_start = i == 0;
         let two: String = rest.iter().take(2).collect();
         let three: String = rest.iter().take(3).collect();
         match three.as_str() {
             "igh" => {
-                push_vowel(&mut out, &mut vowel_positions, "I");
-                i += 3;
-                continue;
+                push_vowel(&mut self.out, &mut self.vowel_positions, "I");
+                return Some(Step::Next(i + 3));
             }
             "tch" => {
-                out.push("ʧ".into());
-                i += 3;
-                continue;
+                self.push_all(&["ʧ"]);
+                return Some(Step::Next(i + 3));
             }
             "dge" => {
-                out.push("ʤ".into());
-                i += 3;
-                continue;
+                self.push_all(&["ʤ"]);
+                return Some(Step::Next(i + 3));
             }
             _ => {}
         }
-        match two.as_str() {
-            "ch" => {
-                out.push("ʧ".into());
-                i += 2;
-                continue;
-            }
-            "sh" => {
-                out.push("ʃ".into());
-                i += 2;
-                continue;
-            }
-            "th" => {
-                out.push("θ".into());
-                i += 2;
-                continue;
-            }
-            "ph" => {
-                out.push("f".into());
-                i += 2;
-                continue;
-            }
-            "ck" => {
-                out.push("k".into());
-                i += 2;
-                continue;
-            }
-            "qu" => {
-                out.push("k".into());
-                out.push("w".into());
-                i += 2;
-                continue;
-            }
-            "wh" => {
-                out.push("w".into());
-                i += 2;
-                continue;
-            }
-            "gh" => {
-                // Word-final → f (laugh, tough); before t → silent (knight's "igh"
-                // rule already handled it); otherwise g (ghost).
-                if i + 2 == n {
-                    out.push("f".into());
-                } else if chars.get(i + 2).copied() != Some('t') {
-                    out.push("ɡ".into());
-                }
-                i += 2;
-                continue;
-            }
-            "ng" if i + 2 == n => {
-                out.push("ŋ".into());
-                i += 2;
-                continue;
-            }
-            "nk" => {
-                out.push("ŋ".into());
-                out.push("k".into());
-                i += 2;
-                continue;
-            }
-            "kn" if at_start => {
-                out.push("n".into());
-                i += 2;
-                continue;
-            }
-            "gn" if at_start => {
-                out.push("n".into());
-                i += 2;
-                continue;
-            }
-            "wr" if at_start => {
-                out.push("ɹ".into());
-                i += 2;
-                continue;
-            }
-            "mb" if i + 2 == n => {
-                out.push("m".into());
-                i += 2;
-                continue;
-            }
-            _ => {}
+        let sounds: &[&str] = match two.as_str() {
+            "ch" => &["ʧ"],
+            "sh" => &["ʃ"],
+            "th" => &["θ"],
+            "ph" => &["f"],
+            "ck" => &["k"],
+            "qu" => &["k", "w"],
+            "wh" => &["w"],
+            // Word-final → f (laugh, tough); before t → silent (knight's "igh"
+            // rule already handled it); otherwise g (ghost).
+            "gh" if i + 2 == n => &["f"],
+            "gh" if self.chars.get(i + 2).copied() != Some('t') => &["ɡ"],
+            "gh" => &[],
+            "ng" if i + 2 == n => &["ŋ"],
+            "nk" => &["ŋ", "k"],
+            "kn" | "gn" if at_start => &["n"],
+            "wr" if at_start => &["ɹ"],
+            "mb" if i + 2 == n => &["m"],
+            _ => return None,
+        };
+        self.push_all(sounds);
+        Some(Step::Next(i + 2))
+    }
+
+    /// Push the vowel at `i` (digraph or single letter); returns how many letters it consumed.
+    fn vowel(&mut self, i: usize, c: char, rest: &[char]) -> usize {
+        let chars = self.chars;
+        let digraph: String = rest.iter().take(2).collect();
+        let digraph_symbol = match digraph.as_str() {
+            "ee" | "ea" | "ie" => Some("i"),
+            "oo" | "ue" | "ui" => Some("u"),
+            "ou" => Some("W"),
+            "ow" => Some("O"),
+            "oi" | "oy" => Some("Y"),
+            "ai" | "ay" | "ei" => Some("A"),
+            "au" | "aw" => Some("ɔ"),
+            "oa" | "oe" => Some("O"),
+            _ => None,
+        };
+        if let Some(sym) = digraph_symbol.filter(|_| rest.len() >= 2) {
+            push_vowel(&mut self.out, &mut self.vowel_positions, sym);
+            return 2;
         }
-        let Some(c) = chars.get(i) else { break };
-        let c = *c;
-        if is_vowel_letter(c) {
-            // Vowel digraphs.
-            let digraph: String = rest.iter().take(2).collect();
-            let digraph_symbol = match digraph.as_str() {
-                "ee" | "ea" | "ie" => Some("i"),
-                "oo" | "ue" | "ui" => Some("u"),
-                "ou" => Some("W"),
-                "ow" => Some("O"),
-                "oi" | "oy" => Some("Y"),
-                "ai" | "ay" | "ei" => Some("A"),
-                "au" | "aw" => Some("ɔ"),
-                "oa" | "oe" => Some("O"),
-                _ => None,
-            };
-            if let Some(sym) = digraph_symbol.filter(|_| rest.len() >= 2) {
-                push_vowel(&mut out, &mut vowel_positions, sym);
-                i += 2;
-                continue;
-            }
-            // A doubled consonant after the vowel keeps it short (little → ˈlɪtəl).
-            let doubled = chars.get(i + 1) == chars.get(i + 2) && chars.get(i + 1).is_some_and(|c| !is_vowel_letter(*c));
-            let long = long_last && last_vowel_index == Some(i) && !doubled;
-            let sym = match (c, long) {
-                ('a', true) => "A",
-                ('e', true) => "i",
-                ('i', true) => "I",
-                ('o', true) => "O",
-                ('u', true) => "u",
-                ('a', _) => "æ",
-                ('e', _) => "ɛ",
-                ('i', _) => "ɪ",
-                ('o', _) => "ɑ",
-                ('u', _) => "ʌ",
-                ('y', _) => "ɪ",
-                _ => "ə",
-            };
-            push_vowel(&mut out, &mut vowel_positions, sym);
-            i += 1;
-            continue;
-        }
-        // Consonants.
+        // A doubled consonant after the vowel keeps it short (little → ˈlɪtəl).
+        let doubled = chars.get(i + 1) == chars.get(i + 2) && chars.get(i + 1).is_some_and(|c| !is_vowel_letter(*c));
+        let long = self.long_last && self.last_vowel_index == Some(i) && !doubled;
+        let sym = match (c, long) {
+            ('a', true) => "A",
+            ('e', true) => "i",
+            ('i', true) => "I",
+            ('o', true) => "O",
+            ('u', true) => "u",
+            ('a', _) => "æ",
+            ('e', _) => "ɛ",
+            ('i', _) => "ɪ",
+            ('o', _) => "ɑ",
+            ('u', _) => "ʌ",
+            ('y', _) => "ɪ",
+            _ => "ə",
+        };
+        push_vowel(&mut self.out, &mut self.vowel_positions, sym);
+        1
+    }
+
+    /// Push the consonant at `i`.
+    fn consonant(&mut self, i: usize, c: char) -> Step {
+        let chars = self.chars;
+        let n = chars.len();
+        let soft = chars.get(i + 1).is_some_and(|n| matches!(n, 'e' | 'i' | 'y'));
         match c {
-            'c' => {
-                let soft = chars.get(i + 1).is_some_and(|n| matches!(n, 'e' | 'i' | 'y'));
-                out.push(if soft { "s".into() } else { "k".into() });
-            }
-            'g' => {
-                let soft = chars.get(i + 1).is_some_and(|n| matches!(n, 'e' | 'i' | 'y'));
-                out.push(if soft { "ʤ".into() } else { "ɡ".into() });
-            }
-            'x' => {
-                out.push("k".into());
-                out.push("s".into());
-            }
-            'j' => out.push("ʤ".into()),
-            'q' => {
-                out.push("k".into());
-            }
+            'c' => self.push_all(&[if soft { "s" } else { "k" }]),
+            'g' => self.push_all(&[if soft { "ʤ" } else { "ɡ" }]),
+            'x' => self.push_all(&["k", "s"]),
+            'j' => self.push_all(&["ʤ"]),
+            'q' => self.push_all(&["k"]),
             'l' if i + 2 == n && chars.get(i + 1) == Some(&'e') && i > 0 && chars.get(i - 1).is_some_and(|c| !is_vowel_letter(*c)) => {
                 // "little", "castle": the final "le" is a syllable əl.
-                out.push("ə".into());
-                out.push("l".into());
-                i += 2;
-                continue;
+                self.push_all(&["ə", "l"]);
+                return Step::Next(i + 2);
             }
-            'y' if at_start => out.push("j".into()),
-            'y' if i + 1 == n => out.push("i".into()),
-            'y' => out.push("ɪ".into()),
+            'y' if i == 0 => self.push_all(&["j"]),
+            'y' if i + 1 == n => self.push_all(&["i"]),
+            'y' => self.push_all(&["ɪ"]),
             other => {
                 let sym = match other {
                     'b' => "b",
@@ -1027,31 +1032,35 @@ fn letter_to_sound(word: &str) -> Option<String> {
                     _ => "",
                 };
                 if !sym.is_empty() {
-                    out.push(sym.into());
+                    self.push_all(&[sym]);
                 }
             }
         }
-        i += 1;
+        Step::Next(i + 1)
     }
-    // Doubled consonants collapse ("narration": rr → r).
-    let mut collapsed: Vec<String> = Vec::new();
-    for sym in out {
-        if collapsed.last() == Some(&sym) && sym.chars().count() == 1 && !is_vowel_kokoro(&sym) {
-            continue;
+
+    /// Collapse doubled consonants and stress the first vowel if nothing is stressed yet.
+    fn finish(self) -> Option<String> {
+        // Doubled consonants collapse ("narration": rr → r).
+        let mut collapsed: Vec<String> = Vec::new();
+        for sym in self.out {
+            if collapsed.last() == Some(&sym) && sym.chars().count() == 1 && !is_vowel_kokoro(&sym) {
+                continue;
+            }
+            collapsed.push(sym);
         }
-        collapsed.push(sym);
+        if collapsed.is_empty() {
+            return None;
+        }
+        // Primary stress on the first vowel if not already marked.
+        if !collapsed.iter().any(|s| s.contains('ˈ') || s.contains('ˌ'))
+            && let Some(pos) = collapsed.iter().position(|s| is_vowel_kokoro(s))
+            && let Some(v) = collapsed.get_mut(pos)
+        {
+            *v = format!("ˈ{v}");
+        }
+        Some(collapsed.join(""))
     }
-    if collapsed.is_empty() {
-        return None;
-    }
-    // Primary stress on the first vowel if not already marked.
-    if !collapsed.iter().any(|s| s.contains('ˈ') || s.contains('ˌ'))
-        && let Some(pos) = collapsed.iter().position(|s| is_vowel_kokoro(s))
-        && let Some(v) = collapsed.get_mut(pos)
-    {
-        *v = format!("ˈ{v}");
-    }
-    Some(collapsed.join(""))
 }
 
 fn push_vowel(out: &mut Vec<String>, positions: &mut Vec<usize>, sym: &str) {

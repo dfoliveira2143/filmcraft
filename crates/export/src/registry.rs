@@ -1,8 +1,10 @@
+#[cfg(test)]
+use super::Ordering;
 use super::encoders::{aac_factory, apv_factory, dnx_factory, h264_factory, mjpeg_factory, prores_factory};
 use super::format::{ExportSettings, Format};
 #[cfg(test)]
 use super::stats::{GPU_FALLBACKS, GPU_FRAMES};
-use super::*;
+use super::{FrameRate, ItemId, OnceLock, PoisonError, Project, Result, RwLock, SampleEntry, SourceProvider, Tick};
 
 /// A packet produced by a video encoder.
 pub struct EncodedPacket {
@@ -47,6 +49,11 @@ pub trait VideoEncoder: Send {
     /// [`VideoEncoder::encode`] picks the result up by [`EncoderFrame::index`] and does the work
     /// itself for a picture that has none; the encoded bytes are the same either way.
     fn prepare_ahead(&self) -> Option<PrepareAhead> {
+        None
+    }
+    /// The hardware encoder doing the work ("NVENC", "VideoToolbox"), `None` for FilmCraft's own
+    /// software encoders: what the export's [`crate::Report::encoder`] names.
+    fn hardware(&self) -> Option<&'static str> {
         None
     }
 }
@@ -115,6 +122,11 @@ pub trait FrameRenderer: Send {
         opts: filmcraft_render::RenderOptions,
         sources: &dyn SourceProvider,
     ) -> Option<filmcraft_render::Image>;
+
+    /// What the renderer's device runs. The export plans with it before taking a renderer
+    /// ([`filmcraft_render::plan::is_cpu_frame`]), so a frame the device can't composite renders
+    /// on the export's own thread instead of on the CPU inside the renderer.
+    fn caps(&self) -> filmcraft_render::plan::DeviceCaps;
 }
 
 /// Builds the frame renderer for one export, or `None` when this host cannot (no adapter).
