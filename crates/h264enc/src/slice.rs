@@ -3,13 +3,14 @@
 use filmcraft_bitstream::BitWriter;
 
 use crate::cabac::{BinSink, CabacEncoder, CabacEstimator, Contexts, CostTable};
-use crate::dsp::{sad, sad16, satd, ssd};
+use crate::dsp::{sad, sad8, sad16, satd, ssd};
 use crate::intra::{Edge4, Edge8, filter8, mode_available, pred_chroma, pred4x4, pred8x8, pred16x16};
 use crate::mbinfo::{MbInfo, MbKind, Mv, Part};
 use crate::nal::{SliceHeader, SliceType, nal};
 use crate::picture::{CHROMA_PAD, Frame, LUMA_PAD, RefPic, avg_into};
+use crate::pixel::{Depth, Pixel, QP_PRIME_MAX};
 use crate::syntax::{MbCode, NbCtx};
-use crate::tables::{BLK4_XY, NUM_CTX, RASTER_TO_BLK4, ZIGZAG4, ZIGZAG8, chroma_qp};
+use crate::tables::{BLK4_XY, NUM_CTX, RASTER_TO_BLK4, ZIGZAG4, ZIGZAG8, chroma_qp_prime};
 use crate::transform::{
     Deadzone, QuantTables, dequant_chroma_dc, dequant_luma_dc, dequant4, dequant8, fdct4, fdct8, idct4, idct8, quant_chroma_dc, quant_luma_dc, quant4, quant8,
 };
@@ -45,17 +46,19 @@ pub struct EncParams {
     pub always_intra: bool,
     /// Maximum CAVLC level magnitude (Baseline).
     pub cavlc_clamp: bool,
+    pub depth: Depth,
 }
 
 /// Per-frame shared encoding state.
-pub struct FrameEnc<'a> {
+pub struct FrameEnc<'a, P> {
     pub p: &'a EncParams,
     pub qt: &'a QuantTables,
     pub cost_tab: &'a CostTable,
     pub st: SliceType,
-    pub src: &'a Frame,
-    pub l0: Option<&'a RefPic>,
-    pub l1: Option<&'a RefPic>,
+    pub src: &'a Frame<P>,
+    pub l0: Option<&'a RefPic<P>>,
+    pub l1: Option<&'a RefPic<P>>,
+    /// Slice QP'Y (QPY + QpBdOffsetY); every `qp` in this module is a QP'.
     pub qp: u8,
     pub aq: &'a [i8],
     pub hdr: SliceHeader,
@@ -65,19 +68,20 @@ pub struct FrameEnc<'a> {
     pub lam: &'a Lambdas,
 }
 
-/// Lambda tables indexed by QP.
+/// Lambda tables indexed by QP'. At higher bit depths QP' = QP + 6 * (BitDepth - 8), so the same QP gets
+/// a lambda 4^(BitDepth - 8) times larger, matching the larger SSD (and 2^(BitDepth - 8) for SATD).
 pub struct Lambdas {
     /// SATD/SAD-domain lambda, Q8.
-    pub sad: [u32; 52],
+    pub sad: [u32; QP_PRIME_MAX + 1],
     /// SSD-domain lambda (for RD), Q8 per 1/256 bit.
-    pub ssd: [f64; 52],
+    pub ssd: [f64; QP_PRIME_MAX + 1],
 }
 
 impl Lambdas {
     pub fn new() -> Self {
-        let mut sad = [0u32; 52];
-        let mut ssd_ = [0f64; 52];
-        for qp in 0..52 {
+        let mut sad = [0u32; QP_PRIME_MAX + 1];
+        let mut ssd_ = [0f64; QP_PRIME_MAX + 1];
+        for qp in 0..=QP_PRIME_MAX {
             let l = 0.85 * 2f64.powf((qp as f64 - 12.0) / 3.0);
             ssd_[qp] = l;
             sad[qp] = ((l.sqrt()) * 256.0).round().max(16.0) as u32;
@@ -93,10 +97,10 @@ impl Default for Lambdas {
 }
 
 /// Mutable band of reconstructed rows belonging to one slice.
-pub struct Band<'b> {
-    pub y: &'b mut [u8],
-    pub u: &'b mut [u8],
-    pub v: &'b mut [u8],
+pub struct Band<'b, P> {
+    pub y: &'b mut [P],
+    pub u: &'b mut [P],
+    pub v: &'b mut [P],
     pub ys: usize,
     pub cs: usize,
 }
@@ -125,28 +129,35 @@ struct Avail {
     tl: bool,
 }
 
-struct MbEdges {
-    top: [u8; 24],
-    left: [u8; 16],
-    tl: u8,
-    ctop: [[u8; 8]; 2],
-    cleft: [[u8; 8]; 2],
-    ctl: [u8; 2],
+struct MbEdges<P> {
+    top: [P; 24],
+    left: [P; 16],
+    tl: P,
+    ctop: [[P; 8]; 2],
+    cleft: [[P; 8]; 2],
+    ctl: [P; 2],
 }
 
 #[derive(Clone)]
-struct Cand {
+struct Cand<P> {
     code: MbCode,
     info: MbInfo,
-    ry: [u8; 256],
-    ru: [u8; 64],
-    rv: [u8; 64],
+    ry: [P; 256],
+    ru: [P; 64],
+    rv: [P; 64],
     cost: u64,
 }
 
-impl Cand {
-    fn new() -> Box<Cand> {
-        Box::new(Cand { code: MbCode::default(), info: MbInfo::default(), ry: [0; 256], ru: [0; 64], rv: [0; 64], cost: u64::MAX })
+impl<P: Pixel> Cand<P> {
+    fn new() -> Box<Cand<P>> {
+        Box::new(Cand {
+            code: MbCode::default(),
+            info: MbInfo::default(),
+            ry: [P::default(); 256],
+            ru: [P::default(); 64],
+            rv: [P::default(); 64],
+            cost: u64::MAX,
+        })
     }
 }
 
@@ -192,9 +203,9 @@ enum Shape {
     Right8x16,
 }
 
-pub struct SliceEnc<'a, 'b> {
-    f: &'a FrameEnc<'a>,
-    band: Band<'b>,
+pub struct SliceEnc<'a, 'b, P> {
+    f: &'a FrameEnc<'a, P>,
+    band: Band<'b, P>,
     mbs: &'b mut [MbInfo],
     y0: usize,
     y1: usize,
@@ -207,8 +218,8 @@ pub struct SliceEnc<'a, 'b> {
     stats: SliceStats,
 }
 
-impl<'a, 'b> SliceEnc<'a, 'b> {
-    pub fn new(f: &'a FrameEnc<'a>, band: Band<'b>, mbs: &'b mut [MbInfo], y0: usize, y1: usize, slice_no: u16) -> Self {
+impl<'a, 'b, P: Pixel> SliceEnc<'a, 'b, P> {
+    pub fn new(f: &'a FrameEnc<'a, P>, band: Band<'b, P>, mbs: &'b mut [MbInfo], y0: usize, y1: usize, slice_no: u16) -> Self {
         SliceEnc { f, band, mbs, y0, y1, slice_no, last_qp: f.qp, prev_dqp_nz: false, cabac: None, cavlc: None, skip_run: 0, stats: SliceStats::default() }
     }
 
@@ -223,7 +234,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             while !bw.is_byte_aligned() {
                 bw.write_bit(true);
             }
-            let ctx = Contexts::init(f.cabac_table, f.qp as i32);
+            let ctx = Contexts::init(f.cabac_table, f.qp as i32 - f.p.depth.qp_offset);
             self.cabac = Some(CabacEncoder::new(ctx, bw.finish()));
         } else {
             self.cavlc = Some(bw);
@@ -274,9 +285,10 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
         (y - self.y0 * 8) * self.band.cs + CHROMA_PAD + x
     }
 
-    fn edges(&self, mx: usize, my: usize, av: Avail) -> MbEdges {
+    fn edges(&self, mx: usize, my: usize, av: Avail) -> MbEdges<P> {
         let (px, py) = (mx * 16, my * 16);
-        let mut e = MbEdges { top: [128; 24], left: [128; 16], tl: 128, ctop: [[128; 8]; 2], cleft: [[128; 8]; 2], ctl: [128; 2] };
+        let m = P::of(self.f.p.depth.mid);
+        let mut e = MbEdges { top: [m; 24], left: [m; 16], tl: m, ctop: [[m; 8]; 2], cleft: [[m; 8]; 2], ctl: [m; 2] };
         if av.top {
             let i = self.ry(px, py - 1);
             e.top[..16].copy_from_slice(&self.band.y[i..i + 16]);
@@ -311,7 +323,8 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
 
     /// Neighbouring partition data at 4x4 offset (bx, by) relative to the MB (range -1..=4).
     /// None = not available; Some((ref, mv)) with ref = -1 for intra / list unused.
-    fn nb_part(&self, cur: &MbInfo, mask: u16, mx: usize, my: usize, bx: i32, by: i32, list: usize) -> Option<(i8, Mv)> {
+    fn nb_part(&self, nb: MvNb, bx: i32, by: i32, list: usize) -> Option<(i8, Mv)> {
+        let MvNb { cur, mask, mx, my } = nb;
         if (0..4).contains(&bx) && (0..4).contains(&by) {
             let r = (by * 4 + bx) as usize;
             if mask & (1 << r) != 0 {
@@ -345,12 +358,13 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
     }
 
     /// Motion vector predictor (§8.4.1.3) for a partition at 4x4 coords (x, y) of size (w, h) (in 4x4 units).
-    fn mvp(&self, cur: &MbInfo, mask: u16, mx: usize, my: usize, x: i32, y: i32, w: i32, list: usize, rf: i8, shape: Shape) -> Mv {
-        let a = self.nb_part(cur, mask, mx, my, x - 1, y, list);
-        let b = self.nb_part(cur, mask, mx, my, x, y - 1, list);
-        let mut c = self.nb_part(cur, mask, mx, my, x + w, y - 1, list);
+    fn mvp(&self, nb: MvNb, geom: PartGeom, list: usize, rf: i8) -> Mv {
+        let PartGeom { x, y, w, shape } = geom;
+        let a = self.nb_part(nb, x - 1, y, list);
+        let b = self.nb_part(nb, x, y - 1, list);
+        let mut c = self.nb_part(nb, x + w, y - 1, list);
         if c.is_none() {
-            c = self.nb_part(cur, mask, mx, my, x - 1, y - 1, list);
+            c = self.nb_part(nb, x - 1, y - 1, list);
         }
         let (mut b, mut c) = (b, c);
         if b.is_none() && c.is_none() && a.is_some() {
@@ -382,13 +396,14 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
 
     fn pskip_mv(&self, mx: usize, my: usize) -> Mv {
         let cur = MbInfo::default();
-        let a = self.nb_part(&cur, 0, mx, my, -1, 0, 0);
-        let b = self.nb_part(&cur, 0, mx, my, 0, -1, 0);
+        let nb = MvNb { cur: &cur, mask: 0, mx, my };
+        let a = self.nb_part(nb, -1, 0, 0);
+        let b = self.nb_part(nb, 0, -1, 0);
         match (a, b) {
             (None, _) | (_, None) => Mv::ZERO,
             (Some((0, m)), _) if m == Mv::ZERO => Mv::ZERO,
             (_, Some((0, m))) if m == Mv::ZERO => Mv::ZERO,
-            _ => self.mvp(&cur, 0, mx, my, 0, 0, 4, 0, 0, Shape::Normal),
+            _ => self.mvp(nb, PartGeom { x: 0, y: 0, w: 4, shape: Shape::Normal }, 0, 0),
         }
     }
 
@@ -403,8 +418,67 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
     }
 }
 
-struct Src {
-    y: [u8; 256],
-    u: [u8; 64],
-    v: [u8; 64],
+/// The macroblock (`mx`, `my`) being analysed: quantiser, neighbour availability and edge samples, and source.
+#[derive(Clone, Copy)]
+struct MbCtx<'x, P> {
+    mx: usize,
+    my: usize,
+    qp: u8,
+    av: Avail,
+    e: &'x MbEdges<P>,
+    src: &'x Src<P>,
+}
+
+/// Where a motion-vector-predictor neighbour lookup happens: the macroblock (`mx`, `my`) whose already
+/// decided partitions (`mask` over the 4x4 blocks of `cur`) are visible.
+#[derive(Clone, Copy)]
+struct MvNb<'c> {
+    cur: &'c MbInfo,
+    mask: u16,
+    mx: usize,
+    my: usize,
+}
+
+/// A partition for motion-vector prediction: 4x4-block origin (`x`, `y`), width `w` (in 4x4 units), and shape.
+#[derive(Clone, Copy)]
+struct PartGeom {
+    x: i32,
+    y: i32,
+    w: i32,
+    shape: Shape,
+}
+
+/// A luma block to motion-search at picture position (`x`, `y`) against `src` (row stride `sstride`).
+#[derive(Clone, Copy)]
+struct SearchBlock<'s, P> {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    src: &'s [P],
+    sstride: usize,
+}
+
+/// Parameters of a sequential per-partition search of macroblock (`mx`, `my`) for one reference list.
+#[derive(Clone, Copy)]
+struct PartSearch {
+    mx: usize,
+    my: usize,
+    part: Part,
+    list: usize,
+    lam: u32,
+    seed: Mv,
+}
+
+/// Destination buffers (luma 16x16, chroma 8x8 each) of a motion-compensated prediction.
+struct PredOut<'p, P> {
+    y: &'p mut [P; 256],
+    u: &'p mut [P; 64],
+    v: &'p mut [P; 64],
+}
+
+struct Src<P> {
+    y: [P; 256],
+    u: [P; 64],
+    v: [P; 64],
 }
