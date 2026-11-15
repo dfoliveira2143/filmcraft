@@ -1,12 +1,12 @@
 use super::labels::LabelPreset;
 use super::media_cache::{cache_usage, clean};
 use super::schema::{CATEGORIES, Kind, fields};
-use super::*;
+use super::{CommandSpec, EngineError, Label, Path, Result, Session, Value, always, bad, bool_p, json, str_p};
 
 // ------------------------------------------------------------------ commands
 
 fn spec(id: &'static str, label: &'static str, params: &'static str, run: fn(&mut Session, &Value) -> Result<Value>, journal: bool) -> CommandSpec {
-    CommandSpec { id, label, menu: &[], shortcut: None, params, enabled: always, run, journal }
+    CommandSpec { id, label, menu: &[], shortcut: None, params, enabled: always, run, journal, named: crate::commands::NamedKeys::NONE }
 }
 
 fn kind_json(k: Kind) -> Value {
