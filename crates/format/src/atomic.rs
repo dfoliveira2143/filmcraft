@@ -7,11 +7,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Most bytes of the target's file name kept in a temp name; the rest of the 255-byte limit is
+/// left for the leading dot, pid, counter and `.tmp`.
+const MAX_STEM_BYTES: usize = 200;
+
 /// The temp file a save of `path` goes through (same directory, so the rename never crosses file
 /// systems). Hidden, and unique per process and call.
 fn temp_path(path: &Path) -> PathBuf {
     let dir = parent_dir(path);
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into());
+    // Keep the whole temp name under the 255-byte file name limit, cutting at a char boundary.
+    let mut end = name.len().min(MAX_STEM_BYTES);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    let name = &name[..end];
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     dir.join(format!(".{name}.{}-{n}.tmp", std::process::id()))
 }
@@ -54,6 +64,49 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
     }
     sync_dir(&parent_dir(path));
     Ok(())
+}
+
+/// Replace `path` with `data` atomically without writing through an alias at the destination.
+///
+/// A link, directory or other special entry at `path` is refused (and left untouched) instead of
+/// being followed, so a raced or planted alias cannot redirect the bytes into another app's file.
+/// The staged file is owner-only (`0600`), since this is used for private application state.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn atomic_write_no_follow(path: &Path, data: &[u8]) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err(io::Error::other("the destination must be a regular file, not an alias or directory")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let tmp = temp_path(path);
+    let r = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        {
+            let mut f = options.open(&tmp)?;
+            f.write_all(data)?;
+            f.sync_all()?;
+        }
+        // `rename` replaces whatever entry holds the name (a link itself, never its target).
+        fs::rename(&tmp, path)
+    })();
+    if let Err(e) = r {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    sync_dir(&parent_dir(path));
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn atomic_write_no_follow(_path: &Path, _data: &[u8]) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "native file replacement is unavailable in the browser"))
 }
 
 /// Publish a complete new file without replacing an occupied final path, including a symlink.
@@ -103,6 +156,18 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn long_file_name_still_saves() {
+        let d = tmpdir("longname");
+        let p = d.join(format!("{}.fcproj", "a".repeat(245)));
+        fs::write(&p, b"old").unwrap();
+        atomic_write(&p, b"new").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"new");
+        let multi = d.join(format!("{}.fcproj", "é".repeat(120)));
+        assert!(temp_path(&multi).file_name().unwrap().len() <= 255);
+        fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
@@ -204,6 +269,38 @@ mod tests {
         assert_eq!(error.to_string(), "simulated full disk");
         assert!(!p.exists());
         assert_eq!(fs::read_dir(&d).unwrap().count(), 0);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_follow_refuses_aliases_and_never_touches_their_target() {
+        let d = tmpdir("no-follow");
+        let external = d.join("stable-state");
+        fs::write(&external, b"stable bytes").unwrap();
+        let link = d.join("nightly-session.json");
+        std::os::unix::fs::symlink(&external, &link).unwrap();
+        assert!(atomic_write_no_follow(&link, b"replacement").is_err());
+        assert_eq!(fs::read(&external).unwrap(), b"stable bytes");
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        // A missing destination is written (a new file), never an error; a directory is refused.
+        fs::create_dir(d.join("sub")).unwrap();
+        assert!(atomic_write_no_follow(&d.join("sub"), b"x").is_err());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_follow_replaces_a_regular_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = tmpdir("no-follow-replace");
+        let p = d.join("nightly-session.json");
+        fs::write(&p, b"old").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write_no_follow(&p, b"new").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"new");
+        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 1, "no staging file is left behind");
         fs::remove_dir_all(&d).unwrap();
     }
 
